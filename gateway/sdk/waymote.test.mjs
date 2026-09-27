@@ -82,7 +82,16 @@ test("printable keys resolve to XKB keysyms from the browser layout", () => {
   })), 0x10020ac);
 });
 
-test("keyboard records use resolved keysyms only when the gateway advertises support", async (t) => {
+test("keyboard and native clipboard input", async (t) => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const navigator = { platform: "Linux x86_64", clipboard: {
+    readText() { assert.fail("paste must not use scripted clipboard reads"); },
+  } };
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: navigator });
+  t.after(() => {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  });
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;
   fakeWindow.VideoDecoder = true;
@@ -112,7 +121,7 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
   canvas.focus = () => {};
   const textInput = new FakeTarget();
   textInput.value = "";
-  textInput.focus = () => {};
+  textInput.focus = t.mock.fn();
   const session = new WaymoteSession({
     endpoint: "https://desktop.example.com",
     audio: false,
@@ -134,19 +143,34 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
   const controlSocket = sockets.get("/control");
   controlSocket.readyState = FakeWebSocket.OPEN;
   controlSocket.dispatch("open", {});
-  const keyEvent = (type, key, overrides = {}) => canvas.dispatch(type, {
-    code: "KeyQ",
-    key,
-    ctrlKey: false,
-    metaKey: false,
-    altKey: false,
-    repeat: false,
-    isComposing: false,
-    keyCode: 81,
-    getModifierState: () => false,
-    preventDefault() {},
-    stopPropagation() {},
-    ...overrides,
+  const keyEvent = (type, key, overrides = {}, target = canvas) => {
+    const event = {
+      code: "KeyQ", key, ctrlKey: false, metaKey: false, altKey: false,
+      repeat: false, isComposing: false, keyCode: 81,
+      getModifierState: () => false,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() {},
+      ...overrides,
+    };
+    target.dispatch(type, event);
+    return event;
+  };
+  const paste = (target, text, types = ["text/plain"]) => {
+    const event = {
+      clipboardData: text === undefined ? null : { types, getData: () => text },
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() {},
+    };
+    target.dispatch("paste", event);
+    return event;
+  };
+  const messages = () => controlSocket.sent.map((record) => {
+    if (typeof record === "string") return JSON.parse(record);
+    const view = new DataView(record);
+    assert.equal(view.getUint8(1), 4);
+    return [view.getUint32(4, true), view.getUint8(2)];
   });
 
   controlSocket.dispatch("message", {
@@ -227,6 +251,172 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
     keyEvent("keyup", "2", { code: "Digit2" });
     assert.deepEqual(keyboardRecords(), [[3, 1, 0], [3, 2, 0], [3, 0, 0]]);
   });
+
+  await t.test("Command-V pastes once with Super released and no missing V keyup", () => {
+    navigator.platform = "MacIntel";
+    controlSocket.sent.length = 0;
+    textInput.focus.mock.resetCalls();
+    keyEvent("keydown", "Meta", { code: "MetaLeft", metaKey: true });
+    assert.equal(keyEvent("keydown", "v", { code: "KeyV", metaKey: true }).defaultPrevented, false);
+    assert.equal(textInput.focus.mock.callCount(), 1);
+    assert.equal(paste(textInput, "Host-7x!\n雪").defaultPrevented, true);
+    assert.equal(keyEvent("keydown", "v", { code: "KeyV", metaKey: true, repeat: true }).defaultPrevented, true);
+    // Safari omits the V keyup while Command is held.
+    keyEvent("keyup", "Meta", { code: "MetaLeft" }, textInput);
+    assert.deepEqual(messages(), [
+      [125, 1], { type: "clipboard-write", text: "Host-7x!\n雪" },
+      [125, 0], [29, 1], [47, 1], [47, 0], [29, 0], [125, 1], [125, 0],
+    ]);
+  });
+
+  await t.test("Command-Shift-V restores physically held right-side modifiers", () => {
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "Meta", { code: "MetaRight", metaKey: true });
+    keyEvent("keydown", "Shift", { code: "ShiftRight", metaKey: true, shiftKey: true });
+    keyEvent("keydown", "V", { code: "KeyV", metaKey: true, shiftKey: true });
+    paste(textInput, "terminal text");
+    keyEvent("keyup", "Meta", { code: "MetaRight", shiftKey: true });
+    keyEvent("keyup", "Shift", { code: "ShiftRight" });
+    assert.deepEqual(messages(), [
+      [126, 1], [54, 1], { type: "clipboard-write", text: "terminal text" },
+      [126, 0], [54, 0], [29, 1], [42, 1], [47, 1], [47, 0], [29, 0], [42, 0],
+      [126, 1], [54, 1], [126, 0], [54, 0],
+    ]);
+  });
+
+  await t.test("Ctrl-V on macOS remains ordinary remote input", () => {
+    controlSocket.sent.length = 0;
+    textInput.focus.mock.resetCalls();
+    keyEvent("keydown", "Control", { code: "ControlLeft", ctrlKey: true });
+    assert.equal(keyEvent("keydown", "v", { code: "KeyV", ctrlKey: true }).defaultPrevented, true);
+    keyEvent("keyup", "v", { code: "KeyV", ctrlKey: true });
+    keyEvent("keyup", "Control", { code: "ControlLeft" });
+    assert.equal(textInput.focus.mock.callCount(), 0);
+    assert.deepEqual(messages(), [[29, 1], [47, 1], [47, 0], [29, 0]]);
+  });
+
+  await t.test("Command release clears lost letter keyups but not modifiers", () => {
+    for (const [code, linuxKey] of [["MetaLeft", 125], ["MetaRight", 126]]) {
+      controlSocket.sent.length = 0;
+      keyEvent("keydown", "Shift", { code: "ShiftLeft", shiftKey: true });
+      keyEvent("keydown", "Meta", { code, metaKey: true, shiftKey: true });
+      keyEvent("keydown", "Z", { code: "KeyZ", metaKey: true, shiftKey: true });
+      keyEvent("keydown", "ArrowLeft", { code: "ArrowLeft", metaKey: true, shiftKey: true });
+      keyEvent("keyup", "Meta", { code, shiftKey: true });
+      // Late keyups from browsers that do deliver them must not release twice.
+      keyEvent("keyup", "Z", { code: "KeyZ", shiftKey: true });
+      keyEvent("keyup", "ArrowLeft", { code: "ArrowLeft", shiftKey: true });
+      keyEvent("keyup", "Shift", { code: "ShiftLeft" });
+      assert.deepEqual(messages(), [
+        [42, 1], [linuxKey, 1], [44, 1], [105, 1], [44, 0], [105, 0], [linuxKey, 0], [42, 0],
+      ]);
+    }
+  });
+
+  await t.test("Linux Super release leaves other held keys alone", () => {
+    navigator.platform = "Linux x86_64";
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "Meta", { code: "MetaLeft", metaKey: true });
+    keyEvent("keydown", "ArrowLeft", { code: "ArrowLeft", metaKey: true });
+    keyEvent("keyup", "Meta", { code: "MetaLeft" });
+    assert.deepEqual(messages(), [[125, 1], [105, 1], [125, 0]]);
+    keyEvent("keyup", "ArrowLeft", { code: "ArrowLeft" });
+    assert.deepEqual(messages().at(-1), [105, 0]);
+  });
+
+  await t.test("fresh presses repair lost keyups and retain resolved keysyms", () => {
+    controlSocket.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active", resolvedKeysyms: true }),
+    });
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "q");
+    keyEvent("keydown", "'");
+    keyEvent("keyup", "'");
+    assert.deepEqual(keyboardRecords(), [[16, 1, 0x71], [16, 0, 0], [16, 1, 0x27], [16, 0, 0]]);
+  });
+
+  await t.test("Linux Ctrl-Shift-V on the IME proxy uses native paste", () => {
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "Control", { code: "ControlLeft", ctrlKey: true }, textInput);
+    keyEvent("keydown", "Shift", { code: "ShiftLeft", ctrlKey: true, shiftKey: true }, textInput);
+    assert.equal(keyEvent("keydown", "V", {
+      code: "KeyV", ctrlKey: true, shiftKey: true,
+    }, textInput).defaultPrevented, false);
+    paste(textInput, "one paste");
+    keyEvent("keyup", "V", { code: "KeyV", ctrlKey: true, shiftKey: true }, textInput);
+    keyEvent("keyup", "Shift", { code: "ShiftLeft", ctrlKey: true }, textInput);
+    keyEvent("keyup", "Control", { code: "ControlLeft" }, textInput);
+    assert.deepEqual(messages(), [
+      [29, 1], [42, 1], { type: "clipboard-write", text: "one paste" },
+      [29, 1], [42, 1], [47, 1], [47, 0], [42, 0], [29, 0],
+    ]);
+  });
+
+  await t.test("extra Meta or Alt prevents Linux platform paste handling", () => {
+    for (const modifier of ["metaKey", "altKey"]) {
+      controlSocket.sent.length = 0;
+      assert.equal(keyEvent("keydown", "v", {
+        code: "KeyV", ctrlKey: true, [modifier]: true,
+      }).defaultPrevented, true);
+      keyEvent("keyup", "v", { code: "KeyV" });
+      assert.deepEqual(messages(), [[47, 1], [47, 0]]);
+    }
+  });
+
+  await t.test("absent text never pastes stale data; empty text and WebKit types work", () => {
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "V", { code: "KeyV", ctrlKey: true, shiftKey: true });
+    keyEvent("keyup", "V", { code: "KeyV" });
+    paste(canvas, undefined);
+    paste(canvas, "", ["image/png"]);
+    assert.deepEqual(messages(), []);
+    for (const [text, types] of [["", ["text/plain"]], ["WebKit-6x!", []]]) {
+      controlSocket.sent.length = 0;
+      assert.equal(paste(canvas, text, types).defaultPrevented, true);
+      assert.deepEqual(messages(), [
+        { type: "clipboard-write", text }, [29, 1], [47, 1], [47, 0], [29, 0],
+      ]);
+    }
+  });
+
+  await t.test("paste enforces the UTF-8 byte limit before sending keys", () => {
+    controlSocket.sent.length = 0;
+    const text = "é".repeat(512 * 1024);
+    paste(canvas, text);
+    assert.deepEqual(messages(), [
+      { type: "clipboard-write", text }, [29, 1], [47, 1], [47, 0], [29, 0],
+    ]);
+    controlSocket.sent.length = 0;
+    paste(canvas, text + "é");
+    assert.deepEqual(messages(), []);
+  });
+
+  await t.test("release and disposal cancel a pending native paste shortcut", async () => {
+    keyEvent("keydown", "V", { code: "KeyV", ctrlKey: true, shiftKey: true });
+    session.input.release();
+    session.input.acquire();
+    controlSocket.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active" }),
+    });
+    controlSocket.sent.length = 0;
+    paste(textInput, "menu paste after release");
+    assert.deepEqual(messages(), [
+      { type: "clipboard-write", text: "menu paste after release" },
+      [29, 1], [47, 1], [47, 0], [29, 0],
+    ]);
+    session.input.release();
+    controlSocket.sent.length = 0;
+    paste(textInput, "not sent");
+    assert.deepEqual(messages(), []);
+    keyEvent("keydown", "v", { code: "KeyV", ctrlKey: true });
+    await session.dispose();
+    controlSocket.sent.length = 0;
+    paste(textInput, "after disposal");
+    paste(canvas, "after disposal");
+    assert.deepEqual(messages(), []);
+    assert.equal(textInput.listenerCount, 0);
+    assert.equal(canvas.listenerCount, 0);
+  });
 });
 
 test("session disposal is terminal, idempotent, and disposes its surface", async () => {
@@ -270,63 +460,6 @@ test("session disposal is terminal, idempotent, and disposes its surface", async
   assert.throws(() => session.audio.setMuted(true), /disposed/);
   assert.throws(() => session.remoteDisplay.manual(), /disposed/);
   session.disconnect();
-});
-
-test("disposal cancels a pending local clipboard paste continuation", async () => {
-  const fakeWindow = new FakeTarget();
-  fakeWindow.devicePixelRatio = 1;
-  const fakeDocument = new FakeTarget();
-  fakeDocument.hidden = false;
-  fakeDocument.pointerLockElement = null;
-  globalThis.window = fakeWindow;
-  globalThis.document = fakeDocument;
-
-  let resolveClipboard;
-  const clipboardText = new Promise((resolve) => {
-    resolveClipboard = resolve;
-  });
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    value: { clipboard: { readText: () => clipboardText } },
-  });
-
-  const canvas = new FakeTarget();
-  canvas.width = 1280;
-  canvas.height = 720;
-  canvas.getContext = () => ({});
-  canvas.requestPointerLock = () => Promise.resolve();
-  canvas.focus = () => {};
-  const textInput = new FakeTarget();
-  textInput.value = "";
-  textInput.focus = () => {};
-
-  const session = new WaymoteSession();
-  session.attachSurface({ canvas, textInputElement: textInput });
-  const originalWarn = console.warn;
-  const warnings = [];
-  console.warn = (...values) => warnings.push(values);
-  try {
-    canvas.dispatch("keydown", {
-      code: "KeyV",
-      ctrlKey: true,
-      metaKey: false,
-      shiftKey: false,
-      repeat: false,
-      isComposing: false,
-      keyCode: 86,
-      preventDefault() {},
-      stopPropagation() {},
-    });
-    const disposal = session.dispose();
-    resolveClipboard("text after disposal");
-    await disposal;
-    await clipboardText;
-    await Promise.resolve();
-    await Promise.resolve();
-    assert.deepEqual(warnings, []);
-  } finally {
-    console.warn = originalWarn;
-  }
 });
 
 test("disconnect invalidates an in-flight audio decoder setup", async () => {

@@ -69,8 +69,14 @@ remote compositor.
 
 Printable keyboard input follows the layout resolved by the browser, so users
 do not need to select their local keyboard layout in the application. Ctrl,
-Meta, and ordinary Alt shortcuts remain physical-key shortcuts. The gateway's
-`-xkb-layout` setting remains the fallback for older browser clients.
+Meta, and ordinary Alt shortcuts remain physical-key shortcuts except for paste.
+The gateway's `-xkb-layout` setting remains the fallback for older browser clients.
+
+The browser's native paste shortcut (Command-V on Apple platforms, Ctrl-V
+elsewhere) sends local clipboard text and pastes remotely with Ctrl-V; adding
+Shift uses Ctrl-Shift-V. Ctrl-V on macOS passes through to the remote application
+without reading the local clipboard. Native paste does not request clipboard-read
+permission.
 
 Audio must be enabled from a user gesture with `session.audio.enable()`. The
 package includes its AudioWorklet beside the SDK module; `audioWorkletURL` can

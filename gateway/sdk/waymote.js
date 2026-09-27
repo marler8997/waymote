@@ -141,6 +141,8 @@ const keyReleased = 0;
 const keyPressed = 1;
 const keyRepeated = 2;
 const linuxPointerButtons = [0x110, 0x112, 0x111, 0x113, 0x114];
+// Linux key codes of Ctrl, Shift, Alt, and Super on either side.
+const modifierKeys = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
 const linuxKeyCodes = new Map([
   ["Escape", 1],
   ["Digit1", 2], ["Digit2", 3], ["Digit3", 4], ["Digit4", 5],
@@ -204,7 +206,7 @@ let resizeRequestID = 0;
 let qualityBitrate = 0;
 let qualityScale = 100;
 let remoteClipboard = null;
-let clipboardPastePending = false;
+let clipboardPasteModifiers = null;
 let pendingClipboardCopy = null;
 let shortcutClipboardCopy = null;
 let inputSequence = 0;
@@ -503,16 +505,42 @@ function sendClipboardText(text) {
   return true;
 }
 
-async function sendLocalClipboard() {
-  if (!navigator.clipboard?.readText) {
-    throw new Error("Clipboard read is unavailable");
-  }
-  const text = await navigator.clipboard.readText();
-  if (sessionDisposed) return false;
-  if (!sendClipboardText(text)) {
-    throw new Error("Clipboard control is inactive");
-  }
-  return true;
+function handlePaste(event) {
+  // Native paste supplies the clipboard for this gesture without asynchronous
+  // clipboard-read permission. Cancel insertion into the IME proxy so the text
+  // has exactly one route to the remote application.
+  event.preventDefault();
+  event.stopPropagation();
+  const modifiers = clipboardPasteModifiers ?? [29];
+  clipboardPasteModifiers = null;
+  physicalTextPending = false;
+  const text = event.clipboardData?.getData("text/plain");
+  if (!text && !event.clipboardData?.types.includes("text/plain")) return;
+  pasteClipboardText(text, modifiers);
+}
+
+function pasteClipboardText(text, modifiers) {
+  if (!sendClipboardText(text)) return;
+
+  // Release unrelated modifiers during paste, then restore physically held keys
+  // for their eventual keyup.
+  const released = [...pressedKeys].filter((key) =>
+    modifierKeys.has(key) && !modifiers.includes(key));
+  for (const key of released) sendControl(keyboardRecord(key, keyReleased));
+  tapRemoteKey(47, modifiers);
+  for (const key of released) sendControl(keyboardRecord(key, keyPressed));
+}
+
+function applePlatform() {
+  return /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+}
+
+// The browser's own paste shortcut: Command-V on Apple platforms, Ctrl-V elsewhere.
+function isPasteShortcut(event) {
+  if (event.altKey) return false;
+  return applePlatform()
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
 }
 
 function copyTextFallback(text) {
@@ -834,6 +862,7 @@ function sendControl(record) {
 
 function releaseInput() {
   pendingPointerPosition = null;
+  clipboardPasteModifiers = null;
   pressedKeys.clear();
   pressedButtons.clear();
   sendControl(controlRecord(controlReleaseAll, false, 0, 0, 0));
@@ -1160,21 +1189,17 @@ function handleKeyDown(event) {
     return;
   }
   const altGraph = event.getModifierState?.("AltGraph") === true;
-  if (!altGraph && (event.ctrlKey || event.metaKey) && event.code === "KeyV") {
-    if (!event.repeat && !clipboardPastePending) {
-      clipboardPastePending = true;
-      const modifiers = shortcutModifiers(event);
-      sendLocalClipboard().catch((error) => {
-        if (!sessionDisposed) {
-          console.warn("local clipboard sync failed", error);
-          setClipboardStatus("Local clipboard unavailable");
-        }
-      }).finally(() => {
-        if (!sessionDisposed) tapRemoteKey(key, modifiers);
-        clipboardPastePending = false;
-      });
+  // Let the platform paste shortcut fire a native paste event with clipboard
+  // data. Scripted clipboard reads instead show WebKit's modal "Paste" menu,
+  // which stalls the page and cannot be reached with a captured pointer.
+  if (!altGraph && isPasteShortcut(event) && event.code === "KeyV") {
+    if (event.repeat) {
+      event.preventDefault();
+    } else {
+      clipboardPasteModifiers = event.shiftKey ? [29, 42] : [29];
+      // WebKit only performs native paste with an editable element focused.
+      imeProxy.focus({ preventScroll: true });
     }
-    event.preventDefault();
     event.stopPropagation();
     return;
   }
@@ -1201,6 +1226,15 @@ function handleKeyDown(event) {
       keyRepeated,
       supportsResolvedKeysyms ? resolvedKeysym(event) : 0,
     ));
+  } else {
+    // A fresh press of a key the remote still holds means its keyup never
+    // reached us; release it first so the remote sees a real new press.
+    sendControl(keyboardRecord(key, keyReleased));
+    sendControl(keyboardRecord(
+      key,
+      keyPressed,
+      supportsResolvedKeysyms ? resolvedKeysym(event) : 0,
+    ));
   }
   physicalTextPending = event.key?.length === 1 && !event.ctrlKey && !event.metaKey;
   event.preventDefault();
@@ -1211,6 +1245,7 @@ function handleKeyUp(event) {
   if (event.isComposing || event.keyCode === 229) {
     return;
   }
+  if (event.code === "KeyV") clipboardPasteModifiers = null;
   const key = linuxKeyCodes.get(event.code);
   if (key === undefined) {
     return;
@@ -1219,6 +1254,18 @@ function handleKeyUp(event) {
       event.code === "ControlLeft" || event.code === "ControlRight" ||
       event.code === "MetaLeft" || event.code === "MetaRight") {
     completeShortcutClipboardCopy();
+  }
+  if ((event.code === "MetaLeft" || event.code === "MetaRight") && applePlatform()) {
+    // macOS browsers can omit keyup for non-modifier keys pressed while Command
+    // is held. Release those keys before Command so they cannot auto-repeat on
+    // the remote compositor. Keep modifiers held until their own keyup.
+    clipboardPasteModifiers = null;
+    for (const held of pressedKeys) {
+      if (!modifierKeys.has(held)) {
+        pressedKeys.delete(held);
+        sendControl(keyboardRecord(held, keyReleased));
+      }
+    }
   }
   if (pressedKeys.delete(key)) {
     sendControl(keyboardRecord(key, keyReleased));
@@ -1911,6 +1958,7 @@ function attachSurface(surfaceOptions) {
   addSurfaceListener(inputElement, "wheel", handleWheel, { passive: false });
   addSurfaceListener(inputElement, "keydown", handleKeyDown);
   addSurfaceListener(inputElement, "keyup", handleKeyUp);
+  addSurfaceListener(inputElement, "paste", handlePaste);
   addSurfaceListener(inputElement, "focus", handleSurfaceFocus);
   addSurfaceListener(inputElement, "blur", handleSurfaceBlur);
   addSurfaceListener(inputElement, "dblclick", () => {
@@ -1919,6 +1967,7 @@ function attachSurface(surfaceOptions) {
   if (imeProxy !== inputElement) {
     addSurfaceListener(imeProxy, "keydown", handleKeyDown);
     addSurfaceListener(imeProxy, "keyup", handleKeyUp);
+    addSurfaceListener(imeProxy, "paste", handlePaste);
   }
   addSurfaceListener(imeProxy, "compositionupdate", handleCompositionUpdate);
   addSurfaceListener(imeProxy, "compositionend", handleCompositionEnd);
@@ -2079,7 +2128,7 @@ function dispose() {
     }
     if (shortcutClipboardCopy) clearTimeout(shortcutClipboardCopy.timeout);
     shortcutClipboardCopy = null;
-    clipboardPastePending = false;
+    clipboardPasteModifiers = null;
     pings.clear();
     resizeRequests.clear();
     audioWanted = false;
