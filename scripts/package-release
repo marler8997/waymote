@@ -24,8 +24,11 @@ mkdir -p "$release_directory"
 
 server_name="waymote-server-$version-linux-$architecture"
 server_root="$staging_directory/$server_name"
+# Zig targets the build machine's CPU by default, which would make the release
+# crash with SIGILL on older processors. Build for the baseline instead.
 zig build install \
     -Doptimize=ReleaseSafe \
+    -Dcpu=baseline \
     -Dversion="$version" \
     --prefix "$server_root"
 install -m 0644 README.md LICENSE "$server_root/"
