@@ -717,8 +717,8 @@ async function pendingVideoSetup(t) {
   const setups = [];
   const decodedTimestamps = [];
   globalThis.VideoDecoder = class {
-    static isConfigSupported() {
-      return new Promise((resolve, reject) => setups.push({ resolve, reject }));
+    static isConfigSupported(configuration) {
+      return new Promise((resolve, reject) => setups.push({ resolve, reject, configuration }));
     }
     state = "unconfigured";
     decodeQueueSize = 0;
@@ -772,6 +772,43 @@ async function pendingVideoSetup(t) {
 }
 
 const settleVideoSetup = () => new Promise((resolve) => setImmediate(resolve));
+
+test("only Windows and macOS Chrome request software video decoding", async (t) => {
+  const chrome = { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/155.0.0.0 Safari/537.36",
+    vendor: "Google Inc." };
+  const macChrome = { ...chrome, userAgent: chrome.userAgent.replace("Windows NT 10.0; Win64; x64", "Macintosh; Intel Mac OS X 10_15_7") };
+  for (const [name, browser, software] of [
+    ["Windows Chrome", { ...chrome, userAgentData: { brands: [{ brand: "Chromium" }, { brand: "Google Chrome" }] } }, true],
+    ["Windows Chrome without client hints", chrome, true],
+    ["Windows Edge", { ...chrome, userAgent: chrome.userAgent + " Edg/155.0.0.0",
+      userAgentData: { brands: [{ brand: "Chromium" }, { brand: "Microsoft Edge" }] } }, false],
+    ["Windows Edge without client hints", { ...chrome, userAgent: chrome.userAgent + " Edg/155.0.0.0" }, false],
+    ["Windows Opera", { ...chrome, userAgent: chrome.userAgent + " OPR/120.0.0.0" }, false],
+    ["Windows Chromium", { ...chrome, userAgentData: { brands: [{ brand: "Chromium" }] } }, false],
+    ["Windows Firefox", { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/145.0", vendor: "" }, false],
+    ["Mac Chrome", { ...macChrome, userAgentData: { brands: [{ brand: "Chromium" }, { brand: "Google Chrome" }] } }, true],
+    ["Mac Chrome without client hints", macChrome, true],
+    ["Mac Edge", { ...macChrome, userAgent: macChrome.userAgent + " Edg/155.0.0.0" }, false],
+    ["Mac Safari", { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15", vendor: "Apple Computer, Inc." }, false],
+    ["Linux Chrome", { ...chrome, userAgent: chrome.userAgent.replace("Windows NT 10.0; Win64; x64", "X11; Linux x86_64") }, false],
+  ]) {
+    await t.test(name, async (t) => {
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: browser });
+      t.after(() => {
+        if (descriptor) Object.defineProperty(globalThis, "navigator", descriptor);
+        else delete globalThis.navigator;
+      });
+      const { setups } = await pendingVideoSetup(t);
+      assert.deepEqual(setups[0].configuration, {
+        codec: "avc1.42E01E", optimizeForLatency: true,
+        ...(software ? { hardwareAcceleration: "prefer-software" } : {}),
+      });
+      setups[0].resolve({ supported: true });
+      await settleVideoSetup();
+    });
+  }
+});
 
 test("video decoder setup retains only the latest bounded frame group", async (t) => {
   const { sockets, setups, decodedTimestamps, message } = await pendingVideoSetup(t);

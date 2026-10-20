@@ -1312,6 +1312,17 @@ async function configureDecoder(configuration) {
     codec: configuration.codec,
     optimizeForLatency: true,
   };
+  const softwareChrome = /Windows NT|Macintosh.*Mac OS X/.test(globalThis.navigator?.userAgent) &&
+    (navigator.userAgentData?.brands
+      ? navigator.userAgentData.brands.some(({ brand }) => brand === "Google Chrome")
+      : navigator.vendor === "Google Inc." && /Chrome\//.test(navigator.userAgent) &&
+        !/(Edg|OPR)\//.test(navigator.userAgent));
+  if (softwareChrome) {
+    // In Windows Chrome 155, software cut control-to-decoded latency from
+    // ~372 ms to ~70 ms; macOS Chrome also improved in manual tests.
+    // Favor interactive latency over potential hardware CPU/power savings.
+    decoderConfiguration.hardwareAcceleration = "prefer-software";
+  }
   waitingForKeyframe = true;
   renderedFrameTimes.length = 0;
   let support;
